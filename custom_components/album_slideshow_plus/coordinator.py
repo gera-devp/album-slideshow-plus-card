@@ -123,6 +123,7 @@ from .const import (
 )
 from .google_albums import album_urls_from_data
 from .store import SlideshowStore
+from . import similar
 from . import spotlight as sp
 from .const import (
     EVENT_NEW_PHOTOS,
@@ -201,6 +202,12 @@ class MediaItem:
     # Runtime-only description of the stream a video is served as (see
     # ``async_video_info``); not persisted.
     video_info: dict[str, Any] | None = None
+    # Album Slideshow Plus: visual fingerprint (64-bit difference hash as
+    # hex) and sharpness, for grouping repeated snaps of one moment. Local
+    # folders only; ``shot_scanned`` is set once the file has been read.
+    fingerprint: str | None = None
+    sharpness: float | None = None
+    shot_scanned: bool = False
 
     def __post_init__(self) -> None:
         if self.photo_id is None:
@@ -864,6 +871,21 @@ def _read_local_exif(path: Path) -> dict[str, Any]:
     return out
 
 
+def _read_local_photo(path: Path) -> dict[str, Any]:
+    """EXIF metadata plus the visual fingerprint and sharpness of a local file.
+
+    Only photos with their own capture time are fingerprinted: grouping
+    repeated snaps relies on when each was taken, and a file's modified time
+    says nothing about that.
+    """
+    out = _read_local_exif(path)
+    if out.get("captured_from_exif"):
+        shot = similar.fingerprint_file(path)
+        if shot is not None:
+            out["fingerprint"], out["sharpness"] = shot
+    return out
+
+
 def _read_exif_from_image(img: Any, out: dict[str, Any]) -> None:
     """Fill ``out`` with capture date / description / GPS from an open image.
 
@@ -894,6 +916,7 @@ def _read_exif_from_image(img: Any, out: dict[str, Any]) -> None:
         parsed = _parse_exif_datetime(dt_raw, offset_raw)
         if parsed is not None:
             out["captured_at"] = parsed
+            out["captured_from_exif"] = True
 
     # Description can come from IPTC / XMP even when the file has no EXIF
     # IFD, so this runs regardless of ``exif`` being present.
@@ -1221,6 +1244,10 @@ def _merge_prior_enrichment(
             item.exif_scanned = True
         if prev.face_scanned and prev.faces is not None:
             item.face_scanned = True
+        if prev.shot_scanned:
+            item.fingerprint = prev.fingerprint
+            item.sharpness = prev.sharpness
+            item.shot_scanned = True
 
 
 class AlbumCoordinator(DataUpdateCoordinator):
@@ -1349,7 +1376,22 @@ class AlbumCoordinator(DataUpdateCoordinator):
             update_interval=self._desired_update_interval(),
         )
 
+        self._shot_settings = (
+            bool(getattr(store, "group_similar_shots", False)),
+            getattr(store, "similar_window_seconds", None),
+        )
+
         def _on_store_change() -> None:
+            shot_settings = (
+                bool(getattr(self.store, "group_similar_shots", False)),
+                getattr(self.store, "similar_window_seconds", None),
+            )
+            if shot_settings != self._shot_settings:
+                self._shot_settings = shot_settings
+                running = self._enrichment_task is not None and not self._enrichment_task.done()
+                if not running and isinstance(self.data, dict) and self.data.get("items"):
+                    # Turned on or widened: fingerprint the new candidates now.
+                    self._schedule_enrichment(self.data)
             desired = self._desired_update_interval()
             if desired == getattr(self, "update_interval", None):
                 return
@@ -1746,7 +1788,8 @@ class AlbumCoordinator(DataUpdateCoordinator):
         needs_geocode = self.reverse_geocode_enabled and any(
             self._needs_geocode_lookup(it) for it in items
         )
-        if not unscanned and not needs_geocode:
+        shot_work = self._shot_candidates(items)
+        if not unscanned and not needs_geocode and not shot_work:
             # Even with nothing to do, mark the phase as ``done`` so the
             # diagnostic sensor stops reporting an in-progress run from
             # the previous refresh.
@@ -1833,6 +1876,9 @@ class AlbumCoordinator(DataUpdateCoordinator):
                     live_photo=bool(raw.get("live_photo", False)),
                     source_album_url=raw.get("source_album_url")
                     if isinstance(raw.get("source_album_url"), str) else None,
+                    fingerprint=raw.get("fingerprint") if isinstance(raw.get("fingerprint"), str) else None,
+                    sharpness=raw.get("sharpness") if isinstance(raw.get("sharpness"), (int, float)) else None,
+                    shot_scanned=bool(raw.get("shot_scanned", False)),
                 ))
             except Exception:
                 continue
@@ -1882,6 +1928,9 @@ class AlbumCoordinator(DataUpdateCoordinator):
                     "source_path": it.source_path,
                     "live_photo": it.live_photo,
                     "source_album_url": it.source_album_url,
+                    "fingerprint": it.fingerprint,
+                    "sharpness": it.sharpness,
+                    "shot_scanned": it.shot_scanned,
                 }
                 for it in items
             ],
@@ -3310,6 +3359,69 @@ class AlbumCoordinator(DataUpdateCoordinator):
         self._enrich_progress["exif_done"] = self._enrich_progress.get("exif_done", 0) + 1
         return True
 
+    # ------------------------------------------------------------------
+    # Album Slideshow Plus: fingerprints for grouping repeated snaps
+    # ------------------------------------------------------------------
+
+    def _shot_candidates(self, items: list[MediaItem]) -> list[MediaItem]:
+        """Local photos taken within the similar-shot window of another photo.
+
+        Only these can be part of a group, so only these are fingerprinted.
+        That decodes a few photos rather than the whole library, which
+        matters when the folder is a network share.
+        """
+        store = getattr(self, "store", None)
+        if (
+            getattr(self, "provider", None) != PROVIDER_LOCAL_FOLDER
+            or not getattr(store, "group_similar_shots", False)
+        ):
+            return []
+        window_ms = int(getattr(store, "similar_window_seconds", 30)) * 1000
+        dated = sorted(
+            (item.captured_at, index) for index, item in enumerate(items)
+            if type(item.captured_at) is int
+        )
+        wanted: list[MediaItem] = []
+        for position, (ts, index) in enumerate(dated):
+            item = items[index]
+            if item.shot_scanned:
+                continue
+            before = position > 0 and ts - dated[position - 1][0] <= window_ms
+            after = position + 1 < len(dated) and dated[position + 1][0] - ts <= window_ms
+            if before or after:
+                wanted.append(item)
+        return wanted
+
+    async def _shot_pass(self, data: dict[str, Any]) -> None:
+        """Fingerprint the photos that could be repeated snaps of one moment."""
+        items: list[MediaItem] = data.get("items") or []
+        work = self._shot_candidates(items)
+        if not work:
+            return
+        _LOGGER.debug("Album Slideshow Plus: checking %d photos for repeated snaps", len(work))
+        self._enrich_progress["phase"] = "similar"
+        pending = 0
+        for item in work:
+            if not item.url.startswith("file://"):
+                item.shot_scanned = True
+                continue
+            path = Path(item.url[len("file://"):])
+            try:
+                info = await self.hass.async_add_executor_job(_read_local_photo, path)
+            except Exception as err:  # noqa: BLE001 - an unreadable file just isn't grouped
+                _LOGGER.debug("Album Slideshow Plus: could not check %s: %s", path, err)
+                info = {}
+            if info.get("fingerprint"):
+                item.fingerprint = info["fingerprint"]
+                item.sharpness = info["sharpness"]
+            item.shot_scanned = True
+            pending += 1
+            if pending >= _EXIF_BATCH_SAVE:
+                pending = 0
+                await self._flush_enrichment(data)
+        if pending:
+            await self._flush_enrichment(data)
+
     async def _flush_enrichment(self, data: dict[str, Any]) -> None:
         """Persist progress (at most once a minute) and notify listeners."""
         now = time.monotonic()
@@ -3357,6 +3469,7 @@ class AlbumCoordinator(DataUpdateCoordinator):
             if pending:
                 await self._flush_enrichment(data)
 
+            await self._shot_pass(data)
             await self._geocode_items_background(data)
         except asyncio.CancelledError:
             _LOGGER.debug("Album enrichment: cancelled, persisting progress")

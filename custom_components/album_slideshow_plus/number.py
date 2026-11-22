@@ -12,6 +12,8 @@ from .const import (
     MAX_SPOTLIGHT_EVERY,
     MAX_STORY_LENGTH,
     MAX_STORY_WINDOW_HOURS,
+    MAX_SIMILAR_WINDOW_SECONDS,
+    MIN_SIMILAR_WINDOW_SECONDS,
 )
 from .coordinator import AlbumCoordinator
 from .store import SlideshowStore
@@ -50,6 +52,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         _StoreNumber(
             entry, store, "story_window_hours", "Story window", "mdi:timer-sand",
             1, MAX_STORY_WINDOW_HOURS, unit="h",
+        ),
+        _StoreNumber(
+            entry, store, "similar_window_seconds", "Similar shot window", "mdi:camera-burst",
+            MIN_SIMILAR_WINDOW_SECONDS, MAX_SIMILAR_WINDOW_SECONDS, unit="s",
         ),
     ]
     # Only providers that can surface videos get the video-length setting.

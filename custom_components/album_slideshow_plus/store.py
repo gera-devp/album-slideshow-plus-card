@@ -39,6 +39,8 @@ from .const import (
     DEFAULT_STORY_WINDOW_HOURS,
     DEFAULT_SLEEP_START,
     DEFAULT_SLEEP_END,
+    DEFAULT_GROUP_SIMILAR,
+    DEFAULT_SIMILAR_WINDOW_SECONDS,
 )
 
 
@@ -131,6 +133,9 @@ class SlideshowStore:
     sleep_enabled: bool = False
     sleep_start: str = DEFAULT_SLEEP_START
     sleep_end: str = DEFAULT_SLEEP_END
+    # Repeated snaps of one moment play once, as the sharpest shot.
+    group_similar_shots: bool = DEFAULT_GROUP_SIMILAR
+    similar_window_seconds: int = DEFAULT_SIMILAR_WINDOW_SECONDS
 
     # In-memory last rendered frame. Not user-configurable; used to re-serve
     # the previous slide instantly across a camera reload.

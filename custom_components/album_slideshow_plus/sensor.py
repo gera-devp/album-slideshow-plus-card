@@ -22,6 +22,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         CacheUsageSensor(entry, coordinator),
         HiddenPhotoCountSensor(entry, coordinator),
         NewPhotosSensor(hass, entry, coordinator),
+        SimilarShotsSensor(hass, entry, coordinator),
     ]
     if (
         coordinator.provider in ENRICHING_PROVIDERS
@@ -243,3 +244,55 @@ class NewPhotosSensor(_BaseAlbumSensor):
                 self.coordinator.added_at(items[indices[0]], store.new_photo_detection)
             )
         return attrs
+
+
+class SimilarShotsSensor(_BaseAlbumSensor):
+    """Album Slideshow Plus: repeated snaps folded into their sharpest shot."""
+
+    _attr_icon = "mdi:camera-burst"
+    _attr_native_unit_of_measurement = "photos"
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry, coordinator: AlbumCoordinator) -> None:
+        super().__init__(entry, coordinator)
+        self.hass = hass
+        self._attr_unique_id = f"{entry.entry_id}_similar_shots"
+        self._attr_name = "Similar shots skipped"
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self.coordinator.store.add_listener(self.async_write_ha_state)
+
+    def _grouping(self):
+        camera = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id, {}).get("camera")
+        if camera is None:
+            return None
+        camera._effective_items()
+        return camera._grouping
+
+    @property
+    def native_value(self):
+        if not self.coordinator.store.group_similar_shots:
+            return 0
+        grouping = self._grouping()
+        return grouping.folded if grouping else 0
+
+    @property
+    def extra_state_attributes(self):
+        grouping = self._grouping() if self.coordinator.store.group_similar_shots else None
+        groups = grouping.groups if grouping else []
+        items = (self.coordinator.data or {}).get("items") or []
+        checked = sum(1 for item in items if getattr(item, "shot_scanned", False))
+        return {
+            "groups": len(groups),
+            "window_seconds": self.coordinator.store.similar_window_seconds,
+            # Local folders: photos taken within the window of another one
+            # that have been compared so far (only those can be repeats).
+            "photos_compared": checked,
+            "examples": [
+                {
+                    "kept": group[0].filename,
+                    "skipped": [item.filename for item in group[1:6]],
+                }
+                for group in groups[:10]
+            ],
+        }

@@ -21,6 +21,7 @@ and the card is `custom:album-slideshow-plus-card`. Upstream docs in
 | Faster album checks while the spotlight is on (default every 30 min) | Integration | Otherwise a new photo waits for the hourly-or-longer refresh |
 | `album_slideshow_plus_new_photos` event when new photos arrive | Integration | Immich Kiosk webhooks |
 | **Memories**: a photo from today's date in an earlier year every N slides or minutes, mixed into the normal slideshow | Integration | ImmichFrame/Kiosk "Memories". Upstream's "On this day" filter shows nothing else |
+| **Group similar shots**: several snaps of the same moment play once, as the sharpest shot | Integration | Burst/duplicate culling in photo apps |
 | **Story mode**: after a random photo, the next few shots from the same outing, in order | Integration | Immich Kiosk discussion #596 (batch/context grouping) |
 | **Sleep schedule**: hold the slideshow overnight; the card goes black or dim with a faint clock | Integration + card | Immich Kiosk `sleep_start`/`sleep_end`, photo-frame on/off times |
 | Show new photo / Show memory / Mark all as seen buttons and actions | Integration | Loop "until dismissed" |
@@ -96,6 +97,41 @@ Entities: `select.…_spotlight_new_photos`, `number.…_spotlight_every`,
 `filenames` and `newest_added_at`), `button.…_show_new_photo`,
 `button.…_mark_all_photos_as_seen`.
 
+## Group similar shots
+
+When you take a few snaps of the same thing, only the sharpest plays.
+Shots are grouped when both of these hold:
+
+* **Taken within the Similar shot window** of each other (default 30 s,
+  2–600 s). This uses the photo's own capture time from EXIF.
+* **They look the same.** Each candidate gets a visual fingerprint (a
+  difference hash of a tiny greyscale copy, plus its average colour). A
+  re-framed or re-exposed snap still matches; a different subject shot
+  seconds later doesn't.
+
+From each group the **sharpest** shot is kept. Sharpness is the variance
+of edge strength, so a shaken or out-of-focus take loses. It judges focus
+and motion blur only, not closed eyes or expressions. The group counts as
+one photo everywhere: the normal rotation, the new-photo spotlight, story
+mode and pairing. Nothing is deleted; turn **Group similar shots** off and
+every snap plays again.
+
+* Only photos with another photo inside the window are read in full, so a
+  NAS library isn't downloaded end to end. Each one is checked once, in the
+  background.
+* Photos without their own capture time (EXIF stripped, as in many
+  WhatsApp copies) are never grouped. A file's modified time would group
+  whatever was copied together.
+* For sources other than local folders there is no fingerprint. Shots
+  taken within the window at the same pixel size are grouped, and the
+  largest file is kept.
+
+Entities: `switch.…_group_similar_shots` (on by default),
+`number.…_similar_shot_window`, `sensor.…_similar_shots_skipped` (with
+`groups`, `photos_compared` and `examples` of kept/skipped files). Camera
+attributes: `similar_shots` (how many snaps the photo on screen stands for),
+`similar_groups`, `similar_shots_folded`.
+
 ## Memories, story mode and sleep
 
 * **Memories (on this day)** + **Memories every**: the same cadence choice.
@@ -152,7 +188,8 @@ and sleep**. The spotlight, memories, story and sleep settings appear under
 `new_photo_window`, `new_photo_detection`, `memories_mode`,
 `memories_every`, `story_length`, `story_window_hours`, `sleep_schedule`,
 `sleep_start`, `sleep_end`, `sleeping`, `slide_hold_seconds`,
-`slide_ends_at`.
+`slide_ends_at`, `group_similar_shots`, `similar_window_seconds`,
+`similar_groups`, `similar_shots_folded`, `similar_shots`.
 
 ## Actions and events
 

@@ -18,6 +18,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_e
         PauseWhenUnwatchedSwitch(entry, store),
         CropDebugSwitch(entry, store),
         SleepScheduleSwitch(entry, store),
+        GroupSimilarShotsSwitch(entry, store),
     ])
 
 
@@ -186,4 +187,46 @@ class SleepScheduleSwitch(SwitchEntity, RestoreEntity):
         old = await self.async_get_last_state()
         if old is not None and old.state in ("on", "off"):
             self.store.sleep_enabled = old.state == "on"
+            self.store.notify()
+
+
+class GroupSimilarShotsSwitch(SwitchEntity, RestoreEntity):
+    """Play repeated snaps of the same moment once, as the sharpest shot."""
+
+    _attr_has_entity_name = True
+    _attr_should_poll = False
+    _attr_icon = "mdi:image-multiple-outline"
+
+    def __init__(self, entry: ConfigEntry, store: SlideshowStore) -> None:
+        self.entry = entry
+        self.store = store
+        self._attr_unique_id = f"{entry.entry_id}_group_similar_shots"
+        self._attr_name = "Group similar shots"
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self.store.group_similar_shots)
+
+    @property
+    def device_info(self):
+        return {
+            "identifiers": {(DOMAIN, self.entry.entry_id)},
+            "name": f"Album Slideshow Plus {self.entry.title}",
+            "manufacturer": "Album Slideshow Plus",
+        }
+
+    async def async_turn_on(self, **kwargs) -> None:
+        self.store.group_similar_shots = True
+        self.store.notify()
+
+    async def async_turn_off(self, **kwargs) -> None:
+        self.store.group_similar_shots = False
+        self.store.notify()
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+        self.store.add_listener(self.async_write_ha_state)
+        old = await self.async_get_last_state()
+        if old is not None and old.state in ("on", "off"):
+            self.store.group_similar_shots = old.state == "on"
             self.store.notify()

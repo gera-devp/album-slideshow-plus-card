@@ -33,7 +33,7 @@
  *                           # allows it, falling back to that button.
  */
 
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 
 const ANIMATED_TRANSITIONS = [
   "fade",
@@ -2476,6 +2476,7 @@ const LIVE_FIELDS = [
   "memories_every",
   "story_length",
   "sleep_enabled",
+  "group_similar_shots",
 ];
 
 const LIVE_SUFFIX = {
@@ -2502,6 +2503,7 @@ const LIVE_SUFFIX = {
   memories_every: "_memories_every",
   story_length: "_story_length",
   sleep_enabled: "_sleep_enabled",
+  group_similar_shots: "_group_similar_shots",
   show_new_photo: "_show_new_photo",
 };
 
@@ -2526,6 +2528,7 @@ const LIVE_LABELS = {
   live_memories_every: "Memories every (slides or minutes)",
   live_story_length: "Story length (photos, 1 = off)",
   live_sleep_enabled: "Sleep schedule",
+  live_group_similar_shots: "Group similar shots (keep the sharpest)",
 };
 
 function humanizeOption(value) {
@@ -2783,6 +2786,7 @@ function createAlbumSlideshowCardEditorClass(Base) {
       });
     }
     if (s.sleep_enabled) items.push({ name: "live_sleep_enabled", selector: { boolean: {} } });
+    if (s.group_similar_shots) items.push({ name: "live_group_similar_shots", selector: { boolean: {} } });
     return items;
   }
 
@@ -3346,6 +3350,7 @@ function createAlbumSlideshowCardEditorClass(Base) {
       }
     }
     if (s.sleep_enabled) out.live_sleep_enabled = st(s.sleep_enabled)?.state === "on";
+    if (s.group_similar_shots) out.live_group_similar_shots = st(s.group_similar_shots)?.state === "on";
     return out;
   }
 
@@ -3426,6 +3431,8 @@ function createAlbumSlideshowCardEditorClass(Base) {
         "After a random photo, show the next photos taken within the story window, in order.",
       live_sleep_enabled:
         "Hold the slideshow between the Sleep start and Sleep end times; this card blanks or dims the screen.",
+      live_group_similar_shots:
+        "Several snaps of the same moment, taken within the Similar shot window, play once as the sharpest shot.",
     };
     return helpers[s.name] || "";
   };
@@ -3618,7 +3625,7 @@ function createAlbumSlideshowCardEditorClass(Base) {
     if (!s || !hass) return;
     const id = s[field];
     if (!id) return;
-    if (field === "paused" || field === "pause_when_unwatched" || field === "sleep_enabled") {
+    if (field === "paused" || field === "pause_when_unwatched" || field === "sleep_enabled" || field === "group_similar_shots") {
       hass.callService("switch", value ? "turn_on" : "turn_off", {
         entity_id: id,
       });

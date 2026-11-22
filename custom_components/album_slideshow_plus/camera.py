@@ -48,8 +48,12 @@ from .const import (
     DEFAULT_STORY_WINDOW_HOURS,
     DEFAULT_SLEEP_START,
     DEFAULT_SLEEP_END,
+    DEFAULT_GROUP_SIMILAR,
+    DEFAULT_SIMILAR_WINDOW_SECONDS,
+    PROVIDER_LOCAL_FOLDER,
 )
 from . import image_processing as ip
+from . import similar
 from . import spotlight as sp
 from . import playlist
 from . import video
@@ -136,6 +140,8 @@ _RENDER_SETTINGS = (
     "memories_every",
     "story_length",
     "story_window_hours",
+    "group_similar_shots",
+    "similar_window_seconds",
 )
 
 # Spotlight kinds, as published in the ``spotlight`` attribute.
@@ -437,6 +443,8 @@ class AlbumSlideshowCamera(Camera):
     _chrono_cache: tuple | None = None
     _sleeping_state: bool = False
     _unsub_sleep = None
+    # Last similar-shot grouping of the playlist.
+    _grouping: similar.Grouping | None = None
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry, coordinator: AlbumCoordinator, store: SlideshowStore) -> None:
         super().__init__()
@@ -795,6 +803,15 @@ class AlbumSlideshowCamera(Camera):
             "sleeping": self._sleeping,
             "slide_hold_seconds": round(hold, 3),
             "slide_ends_at": ends_at,
+            "group_similar_shots": bool(self._setting("group_similar_shots", DEFAULT_GROUP_SIMILAR)),
+            "similar_window_seconds": int(self._setting("similar_window_seconds", DEFAULT_SIMILAR_WINDOW_SECONDS)),
+            "similar_groups": len(self._grouping.groups) if self._grouping else 0,
+            "similar_shots_folded": self._grouping.folded if self._grouping else 0,
+            # The photo on screen stands for this many snaps (1 = no group).
+            "similar_shots": (
+                self._grouping.group_size.get(_photo_key(cur), 1)
+                if self._grouping and cur is not None else 1
+            ),
         }
 
     def _caption_frames(self, cur) -> list[dict]:
@@ -860,6 +877,10 @@ class AlbumSlideshowCamera(Camera):
             self.store.missing_date_mode,
             self.store.order_mode,
             self.store.hidden_revision,
+            bool(getattr(self.store, "group_similar_shots", False)),
+            getattr(self.store, "similar_window_seconds", DEFAULT_SIMILAR_WINDOW_SECONDS),
+            # Fingerprints arrive in the background without a new list.
+            sum(1 for item in raw if getattr(item, "shot_scanned", False)),
             # Date filters move to the next day at local midnight.
             datetime.now(tz).toordinal()
             if self.store.date_filter not in (None, "", DATE_FILTER_OFF)
@@ -884,6 +905,16 @@ class AlbumSlideshowCamera(Camera):
             if key not in seen:
                 seen.add(key)
                 unique.append(item)
+        if getattr(self.store, "group_similar_shots", False):
+            # Repeated snaps of one moment count as one photo: the sharpest.
+            self._grouping = similar.group_similar(
+                unique,
+                getattr(self.store, "similar_window_seconds", DEFAULT_SIMILAR_WINDOW_SECONDS),
+                require_fingerprint=getattr(self.coordinator, "provider", None) == PROVIDER_LOCAL_FOLDER,
+            )
+            unique = self._grouping.kept
+        else:
+            self._grouping = None
         ordered = playlist.order_items(unique, self.store.order_mode)
         self._effective_cache = (hash(cache_key), ordered)
         return ordered
