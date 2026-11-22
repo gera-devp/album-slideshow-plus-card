@@ -1,0 +1,20 @@
+{
+  "domain": "album_slideshow_plus",
+  "name": "Album Slideshow Plus",
+  "codeowners": [
+    "@gera-devp"
+  ],
+  "config_flow": true,
+  "dependencies": [
+    "http",
+    "frontend",
+    "media_source"
+  ],
+  "documentation": "https://github.com/gera-devp/album-slideshow-plus-card",
+  "iot_class": "cloud_polling",
+  "issue_tracker": "https://github.com/gera-devp/album-slideshow-plus-card/issues",
+  "requirements": [
+    "PyNaCl>=1.5.0"
+  ],
+  "version": "1.0.0"
+}

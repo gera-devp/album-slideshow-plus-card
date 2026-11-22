@@ -1,0 +1,53 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r tests/requirements.txt
+      - name: Run pytest
+        run: pytest tests/ -q
+
+  card:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Card tests
+        run: |
+          node --test tests/test_card.cjs tests/test_card_plus.cjs
+
+  version-sync:
+    # manifest.json and the card's VERSION must be bumped together.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Card VERSION must match manifest.json version
+        run: |
+          set -euo pipefail
+          MANIFEST=$(python3 -c "import json;print(json.load(open('custom_components/album_slideshow_plus/manifest.json'))['version'])")
+          CARD=$(grep -E '^const VERSION = ' custom_components/album_slideshow_plus/www/album-slideshow-plus-card.js | sed -E 's/^const VERSION = "(.*)";$/\1/')
+          echo "manifest.json version: $MANIFEST"
+          echo "card VERSION:          $CARD"
+          if [ "$MANIFEST" != "$CARD" ]; then
+            echo "::error::Card VERSION ($CARD) does not match manifest.json version ($MANIFEST). Bump both together."
+            exit 1
+          fi
