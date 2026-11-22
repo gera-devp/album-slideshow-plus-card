@@ -75,7 +75,7 @@ def _valid_position(data) -> dict | None:
 
 async def async_remove_saved_data(hass, entry_id: str) -> None:
     """Delete an album's hidden photos and saved slide position."""
-    for name in ("hidden", "position", "first_seen"):
+    for name in ("hidden", "position", "first_seen", "shots"):
         await Store(hass, 1, _storage_key(entry_id, name)).async_remove()
 
 

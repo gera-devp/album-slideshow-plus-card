@@ -50,7 +50,6 @@ from .const import (
     DEFAULT_SLEEP_END,
     DEFAULT_GROUP_SIMILAR,
     DEFAULT_SIMILAR_WINDOW_SECONDS,
-    PROVIDER_LOCAL_FOLDER,
 )
 from . import image_processing as ip
 from . import similar
@@ -579,6 +578,10 @@ class AlbumSlideshowCamera(Camera):
         self._unsub_viewers = self._viewers.async_track(
             self.entry.entry_id, self._on_viewers_change
         )
+        # Similar shots: the coordinator fingerprints remote photos from a
+        # small preview, fetched with this camera's sign-in and link handling.
+        self.coordinator.shot_fetcher = self._shot_preview_bytes
+        self.coordinator.async_start_shot_worker()
         # Sleep schedule: re-check twice a minute so the window starts and
         # ends on time without a timer per boundary.
         from homeassistant.helpers.event import async_track_time_interval
@@ -910,7 +913,6 @@ class AlbumSlideshowCamera(Camera):
             self._grouping = similar.group_similar(
                 unique,
                 getattr(self.store, "similar_window_seconds", DEFAULT_SIMILAR_WINDOW_SECONDS),
-                require_fingerprint=getattr(self.coordinator, "provider", None) == PROVIDER_LOCAL_FOLDER,
             )
             unique = self._grouping.kept
         else:
@@ -2846,6 +2848,25 @@ class AlbumSlideshowCamera(Camera):
         if self._signed_links() and url.startswith("http"):
             return self.coordinator.download_key(url)
         return url
+
+    async def _shot_preview_bytes(self, item: MediaItem) -> bytes | None:
+        """A small copy of a remote photo, for its similar-shot fingerprint.
+
+        Not cached: it is read once, then only the fingerprint is kept.
+        """
+        url = item.url
+        try:
+            if url.startswith("http"):
+                if getattr(self.coordinator, "provider", None) == PROVIDER_GOOGLE_SHARED:
+                    from .google_scraper import _SIZE_SUFFIX_RE
+
+                    url = _SIZE_SUFFIX_RE.sub("", url) + "=w512-h512"
+                return await self._fetch_remote(url)
+            if not url.startswith("file://"):
+                return await self._provider_bytes(url)
+        except Exception as err:  # noqa: BLE001 - this photo just isn't grouped yet
+            _LOGGER.debug("Album Slideshow Plus: no preview for %s: %s", url, err)
+        return None
 
     async def _fetch_remote(self, url: str) -> bytes | None:
         """Download a remote image, renewing its signed link once it expires."""

@@ -1368,6 +1368,15 @@ class AlbumCoordinator(DataUpdateCoordinator):
         self.last_new_photo_keys: list[str] = []
         # "Mark all as seen": photos added up to this time are no longer new.
         self._acknowledged_before: int | None = None
+        # Similar shots: photo key -> [fingerprint or None, sharpness or None]
+        # for every photo checked, so each is read only once, whatever the
+        # source. ``shot_fetcher`` (set by the camera) returns preview bytes
+        # for a remote photo.
+        self._shots_store: Store = Store(hass, 1, f"{DOMAIN}.{entry.entry_id}.shots")
+        self._shots: dict[str, list] = {}
+        self._shots_loaded = False
+        self._shot_task: asyncio.Task | None = None
+        self.shot_fetcher = None
 
         super().__init__(
             hass,
@@ -1388,10 +1397,8 @@ class AlbumCoordinator(DataUpdateCoordinator):
             )
             if shot_settings != self._shot_settings:
                 self._shot_settings = shot_settings
-                running = self._enrichment_task is not None and not self._enrichment_task.done()
-                if not running and isinstance(self.data, dict) and self.data.get("items"):
-                    # Turned on or widened: fingerprint the new candidates now.
-                    self._schedule_enrichment(self.data)
+                # Turned on or widened: fingerprint the new candidates now.
+                self.async_start_shot_worker()
             desired = self._desired_update_interval()
             if desired == getattr(self, "update_interval", None):
                 return
@@ -1550,6 +1557,7 @@ class AlbumCoordinator(DataUpdateCoordinator):
         # the new scan runs - it would otherwise race against the new
         # item list and risk re-saving stale data over fresh state.
         await self._cancel_enrichment()
+        self._cancel_shot_worker()
         await self._ensure_first_seen_loaded()
 
         try:
@@ -1637,6 +1645,8 @@ class AlbumCoordinator(DataUpdateCoordinator):
                 await self._track_first_seen(items)
             except Exception as err:  # noqa: BLE001 - never fail the refresh for it
                 _LOGGER.debug("Album Slideshow Plus: first-seen tracking failed: %s", err)
+            await self._apply_known_shots(items)
+            self.async_start_shot_worker(items)
         else:
             cached = await self._load_cached_items()
             if cached and cached.get("items"):
@@ -1647,6 +1657,12 @@ class AlbumCoordinator(DataUpdateCoordinator):
                 return cached
 
         return data
+
+    def _cancel_shot_worker(self) -> None:
+        task = getattr(self, "_shot_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+        self._shot_task = None
 
     async def _cancel_enrichment(self) -> None:
         """Cancel and reap any in-flight background enrichment task."""
@@ -1788,8 +1804,7 @@ class AlbumCoordinator(DataUpdateCoordinator):
         needs_geocode = self.reverse_geocode_enabled and any(
             self._needs_geocode_lookup(it) for it in items
         )
-        shot_work = self._shot_candidates(items)
-        if not unscanned and not needs_geocode and not shot_work:
+        if not unscanned and not needs_geocode:
             # Even with nothing to do, mark the phase as ``done`` so the
             # diagnostic sensor stops reporting an in-progress run from
             # the previous refresh.
@@ -3364,22 +3379,24 @@ class AlbumCoordinator(DataUpdateCoordinator):
     # ------------------------------------------------------------------
 
     def _shot_candidates(self, items: list[MediaItem]) -> list[MediaItem]:
-        """Local photos taken within the similar-shot window of another photo.
+        """Photos taken within the similar-shot window of another photo.
 
-        Only these can be part of a group, so only these are fingerprinted.
-        That decodes a few photos rather than the whole library, which
-        matters when the folder is a network share.
+        Only these can be part of a group, so only these are fingerprinted:
+        a few photos rather than the whole library, which matters for a
+        network share or a cloud album. Local photos count once their own
+        capture time has been read; remote ones need the camera's fetcher.
         """
         store = getattr(self, "store", None)
-        if (
-            getattr(self, "provider", None) != PROVIDER_LOCAL_FOLDER
-            or not getattr(store, "group_similar_shots", False)
-        ):
+        if not getattr(store, "group_similar_shots", False):
+            return []
+        local = getattr(self, "provider", None) == PROVIDER_LOCAL_FOLDER
+        if not local and getattr(self, "shot_fetcher", None) is None:
             return []
         window_ms = int(getattr(store, "similar_window_seconds", 30)) * 1000
         dated = sorted(
             (item.captured_at, index) for index, item in enumerate(items)
-            if type(item.captured_at) is int
+            if type(item.captured_at) is int and not item.is_video
+            and (item.exif_scanned or not local)
         )
         wanted: list[MediaItem] = []
         for position, (ts, index) in enumerate(dated):
@@ -3392,35 +3409,109 @@ class AlbumCoordinator(DataUpdateCoordinator):
                 wanted.append(item)
         return wanted
 
-    async def _shot_pass(self, data: dict[str, Any]) -> None:
-        """Fingerprint the photos that could be repeated snaps of one moment."""
-        items: list[MediaItem] = data.get("items") or []
-        work = self._shot_candidates(items)
-        if not work:
+    async def _ensure_shots_loaded(self) -> None:
+        if getattr(self, "_shots_loaded", True):
             return
-        _LOGGER.debug("Album Slideshow Plus: checking %d photos for repeated snaps", len(work))
-        self._enrich_progress["phase"] = "similar"
-        pending = 0
-        for item in work:
-            if not item.url.startswith("file://"):
+        self._shots_loaded = True
+        try:
+            payload = await self._shots_store.async_load()
+        except Exception as err:  # noqa: BLE001 - only grouping depends on it
+            _LOGGER.debug("Album Slideshow Plus: could not read similar-shot data: %s", err)
+            payload = None
+        if isinstance(payload, dict) and isinstance(payload.get("shots"), dict):
+            self._shots = {
+                key: value for key, value in payload["shots"].items()
+                if isinstance(key, str) and isinstance(value, list) and len(value) == 2
+            }
+
+    def _save_shots(self) -> None:
+        store = getattr(self, "_shots_store", None)
+        if store is None:
+            return
+        data = {"shots": dict(self._shots)}
+        store.async_delay_save(lambda: data, 15)
+
+    async def _apply_known_shots(self, items: list[MediaItem]) -> None:
+        """Put stored fingerprints back on a freshly listed album."""
+        if not hasattr(self, "_shots_store"):
+            return
+        await self._ensure_shots_loaded()
+        for item in items:
+            known = self._shots.get(sp.photo_key(item))
+            if known is not None:
+                item.fingerprint, item.sharpness = known
                 item.shot_scanned = True
+        if len(self._shots) > max(2 * len(items), 200):
+            keep = {sp.photo_key(item) for item in items}
+            self._shots = {key: value for key, value in self._shots.items() if key in keep}
+            self._save_shots()
+
+    def async_start_shot_worker(self, items: list[MediaItem] | None = None) -> None:
+        """Fingerprint new candidates in the background (one worker at a time)."""
+        if items is None:
+            items = (self.data or {}).get("items") or [] if isinstance(self.data, dict) else []
+        create = getattr(getattr(self, "hass", None), "async_create_background_task", None)
+        if not items or create is None:
+            return
+        task = getattr(self, "_shot_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+        self._shot_task = create(
+            self._shot_worker(items),
+            name=f"{DOMAIN}_similar_shots_{self.entry.entry_id}",
+        )
+
+    async def _shot_worker(self, items: list[MediaItem]) -> None:
+        await self._ensure_shots_loaded()
+        while True:
+            work = self._shot_candidates(items)
+            if work:
+                await self._shot_pass(work)
+            # Local capture times arrive from the date scan; check again
+            # once it has finished.
+            enrich = getattr(self, "_enrichment_task", None)
+            if enrich is not None and not enrich.done():
+                await asyncio.wait([enrich])
                 continue
-            path = Path(item.url[len("file://"):])
-            try:
-                info = await self.hass.async_add_executor_job(_read_local_photo, path)
-            except Exception as err:  # noqa: BLE001 - an unreadable file just isn't grouped
-                _LOGGER.debug("Album Slideshow Plus: could not check %s: %s", path, err)
-                info = {}
-            if info.get("fingerprint"):
-                item.fingerprint = info["fingerprint"]
-                item.sharpness = info["sharpness"]
+            return
+
+    async def _shot_pass(self, work: list[MediaItem]) -> None:
+        """Fingerprint the photos that could be repeated snaps of one moment."""
+        _LOGGER.debug("Album Slideshow Plus: checking %d photos for repeated snaps", len(work))
+        fetcher = getattr(self, "shot_fetcher", None)
+        changed = 0
+        for item in work:
+            shot = None
+            if item.url.startswith("file://"):
+                try:
+                    info = await self.hass.async_add_executor_job(
+                        _read_local_photo, Path(item.url[len("file://"):]),
+                    )
+                except Exception as err:  # noqa: BLE001 - an unreadable file just isn't grouped
+                    _LOGGER.debug("Album Slideshow Plus: could not check %s: %s", item.url, err)
+                    info = {}
+                if info.get("fingerprint"):
+                    shot = (info["fingerprint"], info["sharpness"])
+            elif fetcher is not None:
+                data = await fetcher(item)
+                if data is None:
+                    # Couldn't download it now; try again on the next refresh.
+                    continue
+                shot = await self.hass.async_add_executor_job(similar.fingerprint_bytes, data)
+                # Be gentle with the photo service.
+                await asyncio.sleep(0.2)
+            else:
+                continue
+            item.fingerprint, item.sharpness = shot if shot else (None, None)
             item.shot_scanned = True
-            pending += 1
-            if pending >= _EXIF_BATCH_SAVE:
-                pending = 0
-                await self._flush_enrichment(data)
-        if pending:
-            await self._flush_enrichment(data)
+            self._shots[sp.photo_key(item)] = [item.fingerprint, item.sharpness]
+            changed += 1
+            if changed % 25 == 0:
+                self._save_shots()
+                self.async_update_listeners()
+        if changed:
+            self._save_shots()
+            self.async_update_listeners()
 
     async def _flush_enrichment(self, data: dict[str, Any]) -> None:
         """Persist progress (at most once a minute) and notify listeners."""
@@ -3469,7 +3560,6 @@ class AlbumCoordinator(DataUpdateCoordinator):
             if pending:
                 await self._flush_enrichment(data)
 
-            await self._shot_pass(data)
             await self._geocode_items_background(data)
         except asyncio.CancelledError:
             _LOGGER.debug("Album enrichment: cancelled, persisting progress")

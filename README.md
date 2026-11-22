@@ -116,15 +116,23 @@ one photo everywhere: the normal rotation, the new-photo spotlight, story
 mode and pairing. Nothing is deleted; turn **Group similar shots** off and
 every snap plays again.
 
-* Only photos with another photo inside the window are read in full, so a
-  NAS library isn't downloaded end to end. Each one is checked once, in the
-  background.
+* Only photos with another photo inside the window are fingerprinted, so
+  a NAS library isn't downloaded end to end. Each one is checked once, in
+  the background, and the result is saved, so a restart doesn't repeat it.
+* Local folders: the file itself is read. Other sources: a small preview
+  is downloaded once for each candidate (512 px for Google shared albums;
+  the source's own photo link elsewhere). Only the fingerprint is kept.
 * Photos without their own capture time (EXIF stripped, as in many
   WhatsApp copies) are never grouped. A file's modified time would group
   whatever was copied together.
-* For sources other than local folders there is no fingerprint. Shots
-  taken within the window at the same pixel size are grouped, and the
-  largest file is kept.
+* A photo is never grouped until it has a fingerprint. Right after
+  installing or updating, the count climbs as the background check works
+  through the library.
+
+> **1.1.1 fix:** 1.1.0 grouped photos from sources other than local
+> folders by time and pixel size alone. With phone photos that are all the
+> same size, that hid most of a library. 1.1.1 groups only shots that also
+> look the same, and fingerprints those sources from a small preview.
 
 Entities: `switch.…_group_similar_shots` (on by default),
 `number.…_similar_shot_window`, `sensor.…_similar_shots_skipped` (with

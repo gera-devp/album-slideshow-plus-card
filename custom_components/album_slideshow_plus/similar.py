@@ -10,13 +10,13 @@ Two shots belong to one group when both hold:
    forms one group, capped at ``MAX_GROUP_SPAN_FACTOR`` windows overall.
 2. **They look the same.** Their visual fingerprints (a 64-bit difference
    hash of a tiny greyscale copy) differ in at most ``MAX_DISTANCE`` bits,
-   and their average colours are close (``MAX_COLOUR_DISTANCE``). Sources
-   whose photos have no fingerprint fall back to the same orientation and,
-   when known, the same pixel size.
+   and their average colours are close (``MAX_COLOUR_DISTANCE``).
 
-Local photos are fingerprinted only when they carry their own capture time
-(EXIF). A file's modified time is no evidence of when it was taken: a bulk
-copy gives unrelated photos the same time.
+A photo without a fingerprint is never grouped. Time alone is no evidence:
+at a family event people take one different shot after another within
+seconds. Local photos are fingerprinted only when they carry their own
+capture time (EXIF), since a bulk copy gives unrelated files the same
+modified time; other sources are fingerprinted from a small preview.
 
 Within a group the sharpest shot is kept: the one with the highest
 variance of edges (a blurred or shaken shot has soft edges). When
@@ -66,6 +66,20 @@ def fingerprint_image(img: Image.Image) -> tuple[str, float]:
     return f"{value:016x}{r:02x}{g:02x}{b:02x}", round(sharpness, 2)
 
 
+def fingerprint_bytes(data: bytes) -> tuple[str, float] | None:
+    """Fingerprint image bytes (a downloaded preview)."""
+    import io
+
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            if img.format == "JPEG":
+                img.draft("RGB", (_SHARPNESS_EDGE, _SHARPNESS_EDGE))
+            img.load()
+            return fingerprint_image(img)
+    except Exception:  # noqa: BLE001 - an unreadable preview just isn't grouped
+        return None
+
+
 def fingerprint_file(path: Any) -> tuple[str, float] | None:
     """Fingerprint an image file, decoding JPEGs at a reduced size."""
     try:
@@ -103,25 +117,18 @@ def _portrait(item: Any) -> bool | None:
     return None
 
 
-def looks_same(a: Any, b: Any, *, require_fingerprint: bool, max_distance: int = MAX_DISTANCE) -> bool:
-    """Whether two shots show the same picture."""
+def looks_same(a: Any, b: Any, *, max_distance: int = MAX_DISTANCE) -> bool:
+    """Whether two shots show the same picture. Both need a fingerprint."""
+    fa, fb = getattr(a, "fingerprint", None), getattr(b, "fingerprint", None)
+    if not fa or not fb:
+        return False
     pa, pb = _portrait(a), _portrait(b)
     if pa is not None and pb is not None and pa != pb:
         return False
-    fa, fb = getattr(a, "fingerprint", None), getattr(b, "fingerprint", None)
-    if fa and fb:
-        colour = colour_distance(fa, fb)
-        if colour is not None and colour > MAX_COLOUR_DISTANCE:
-            return False
-        return distance(fa, fb) <= max_distance
-    if require_fingerprint:
+    colour = colour_distance(fa, fb)
+    if colour is not None and colour > MAX_COLOUR_DISTANCE:
         return False
-    # No fingerprints (remote sources): time plus matching size.
-    wa, ha, wb, hb = (getattr(a, "width", None), getattr(a, "height", None),
-                      getattr(b, "width", None), getattr(b, "height", None))
-    if all(isinstance(v, int) for v in (wa, ha, wb, hb)):
-        return (wa, ha) == (wb, hb)
-    return pa is not None and pb is not None
+    return distance(fa, fb) <= max_distance
 
 
 def _quality(item: Any, position: int) -> tuple:
@@ -152,7 +159,6 @@ def group_similar(
     items: Sequence[Any],
     window_seconds: float,
     *,
-    require_fingerprint: bool,
     max_distance: int = MAX_DISTANCE,
 ) -> Grouping:
     """Group repeated snaps; keep the sharpest of each group, in playlist order."""
@@ -161,7 +167,7 @@ def group_similar(
         return Grouping(kept=list(items))
     dated = sorted(
         (item.captured_at, index) for index, item in enumerate(items)
-        if type(getattr(item, "captured_at", None)) is int
+        if type(getattr(item, "captured_at", None)) is int and getattr(item, "fingerprint", None)
     )
     # Open groups: [indices], first capture time, last capture time.
     open_groups: list[list] = []
@@ -179,8 +185,7 @@ def group_similar(
             if ts - group[1] > window_ms * MAX_GROUP_SPAN_FACTOR:
                 continue
             if any(
-                looks_same(items[member], items[index], require_fingerprint=require_fingerprint,
-                           max_distance=max_distance)
+                looks_same(items[member], items[index], max_distance=max_distance)
                 for member in group[0]
             ):
                 home = group

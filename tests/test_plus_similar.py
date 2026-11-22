@@ -92,7 +92,7 @@ def test_same_layout_in_different_colours_is_not_the_same_shot():
     assert similar.distance(fp, fp2) <= similar.MAX_DISTANCE
     items = [_photo("a", at=T0, fp=fp, sharp=sharp), _photo("b", at=T0 + 1_000, fp=fp2, sharp=sharp2)]
     assert similar.colour_distance(fp, fp2) > similar.MAX_COLOUR_DISTANCE
-    assert similar.group_similar(items, 30, require_fingerprint=True).folded == 0
+    assert similar.group_similar(items, 30).folded == 0
 
 
 def test_snaps_of_one_moment_fold_into_the_sharpest():
@@ -108,7 +108,7 @@ def test_snaps_of_one_moment_fold_into_the_sharpest():
         _photo("other_scene", at=T0 + 9_000, fp=fp_other, sharp=sharp_other),
         _photo("same_scene_next_day", at=T0 + 86_400_000, fp=fp, sharp=sharp),
     ]
-    result = similar.group_similar(items, 30, require_fingerprint=True)
+    result = similar.group_similar(items, 30)
     assert [item.filename for item in result.kept] == ["sharp.jpg", "other_scene.jpg", "same_scene_next_day.jpg"]
     assert len(result.groups) == 1 and result.folded == 2
     assert [item.filename for item in result.groups[0]][0] == "sharp.jpg"
@@ -119,8 +119,8 @@ def test_shots_further_apart_than_the_window_stay_separate():
     base = _scene(7)
     fp, sharp = similar.fingerprint_image(base)
     items = [_photo("a", at=T0, fp=fp, sharp=sharp), _photo("b", at=T0 + 45_000, fp=fp, sharp=sharp)]
-    assert similar.group_similar(items, 30, require_fingerprint=True).folded == 0
-    assert similar.group_similar(items, 60, require_fingerprint=True).folded == 1
+    assert similar.group_similar(items, 30).folded == 0
+    assert similar.group_similar(items, 60).folded == 1
 
 
 def test_interleaved_subjects_still_group_correctly():
@@ -133,31 +133,29 @@ def test_interleaved_subjects_still_group_correctly():
         _photo("a1", at=T0, fp=fa, sharp=sa), _photo("b1", at=T0 + 2_000, fp=fb, sharp=sb),
         _photo("a2", at=T0 + 4_000, fp=fa2, sharp=1), _photo("b2", at=T0 + 6_000, fp=fb2, sharp=1),
     ]
-    result = similar.group_similar(items, 30, require_fingerprint=True)
+    result = similar.group_similar(items, 30)
     assert sorted(item.filename for item in result.kept) == ["a1.jpg", "b1.jpg"]
 
 
-def test_local_photos_wait_for_their_fingerprint():
-    items = [_photo("a", at=T0), _photo("b", at=T0 + 1_000)]
-    assert similar.group_similar(items, 30, require_fingerprint=True).folded == 0
-
-
-def test_sources_without_fingerprints_group_by_time_and_size():
+def test_photos_without_a_fingerprint_are_never_grouped():
+    # Same time, same size, same phone: at a family event that is usually a
+    # different picture, so nothing is grouped until both have been checked.
     items = [
         _photo("a", at=T0, w=4000, h=3000, size=3_000_000),
         _photo("b", at=T0 + 2_000, w=4000, h=3000, size=3_400_000),
-        _photo("portrait", at=T0 + 4_000, w=3000, h=4000),
+        _photo("c", at=T0 + 4_000, w=4000, h=3000, size=3_100_000),
     ]
-    result = similar.group_similar(items, 30, require_fingerprint=False)
-    # The bigger file (more detail) is kept; a different orientation is not the same shot.
-    assert [item.filename for item in result.kept] == ["b.jpg", "portrait.jpg"]
+    assert similar.group_similar(items, 30).folded == 0
+    fp, sharp = similar.fingerprint_image(_scene(12))
+    items[0].fingerprint, items[0].sharpness = fp, sharp
+    assert similar.group_similar(items, 30).folded == 0
 
 
 def test_window_zero_or_tiny_albums_change_nothing():
     items = [_photo("a", at=T0, fp="0" * 22, sharp=1)]
-    assert similar.group_similar(items, 30, require_fingerprint=True).kept == items
+    assert similar.group_similar(items, 30).kept == items
     two = items + [_photo("b", at=T0, fp="0" * 22, sharp=2)]
-    assert similar.group_similar(two, 0, require_fingerprint=True).kept == two
+    assert similar.group_similar(two, 0).kept == two
 
 
 def _cam(items, *, group=True):
@@ -197,12 +195,114 @@ def test_only_photos_with_a_neighbour_in_the_window_are_fingerprinted():
     items = [
         _photo("burst_a", at=T0), _photo("burst_b", at=T0 + 4_000),
         _photo("alone", at=T0 + 3_600_000), _photo("undated"),
-        _photo("burst_c_done", at=T0 + 8_000),
+        _photo("burst_c_done", at=T0 + 8_000), _photo("date_not_read_yet", at=T0 + 9_000),
     ]
+    for item in items[:5]:
+        item.exif_scanned = True
     items[4].shot_scanned = True
+    # Local photos wait for their own capture time (the date scan).
     assert [item.filename for item in coord._shot_candidates(items)] == ["burst_a.jpg", "burst_b.jpg"]
     coord.store.group_similar_shots = False
     assert coord._shot_candidates(items) == []
     coord.store.group_similar_shots = True
-    coord.provider = "immich"
+    # Remote sources need the camera's preview fetcher.
+    coord.provider = "google_shared"
+    coord.shot_fetcher = None
     assert coord._shot_candidates(items) == []
+    coord.shot_fetcher = lambda item: None
+    assert [item.filename for item in coord._shot_candidates(items)] == [
+        "burst_a.jpg", "burst_b.jpg", "date_not_read_yet.jpg",
+    ]
+
+
+class _FakeHass:
+    async def async_add_executor_job(self, func, *args):
+        return func(*args)
+
+
+def _remote(name, at):
+    return MediaItem(
+        url=f"https://photos.example/{name}=w4000-h3000", width=4000, height=3000,
+        mime_type="image/jpeg", filename=f"{name}.jpg", source_id=name, captured_at=at,
+    )
+
+
+def _jpeg(img) -> bytes:
+    import io
+
+    buf = io.BytesIO()
+    img.save(buf, "JPEG", quality=85)
+    return buf.getvalue()
+
+
+def test_remote_photos_are_fingerprinted_from_a_preview_and_remembered():
+    import asyncio
+
+    from custom_components.album_slideshow_plus.coordinator import AlbumCoordinator
+
+    base = _scene(13)
+    previews = {
+        "sharp": _jpeg(base), "shaky": _jpeg(base.filter(ImageFilter.GaussianBlur(3))),
+        "next_shot": _jpeg(_scene(14)), "unreachable": None,
+    }
+
+    async def fetcher(item):
+        return previews[item.source_id]
+
+    saved = []
+    coord = AlbumCoordinator.__new__(AlbumCoordinator)
+    coord.hass = _FakeHass()
+    coord.provider = "google_shared"
+    coord.store = types.SimpleNamespace(group_similar_shots=True, similar_window_seconds=30)
+    coord.shot_fetcher = fetcher
+    coord._shots, coord._shots_loaded = {}, True
+    coord._shots_store = types.SimpleNamespace(async_delay_save=lambda fn, delay: saved.append(fn()))
+    coord.async_update_listeners = lambda: None
+    items = [_remote("shaky", T0), _remote("sharp", T0 + 2_000), _remote("next_shot", T0 + 5_000),
+             _remote("unreachable", T0 + 7_000)]
+
+    async def run():
+        real_sleep = asyncio.sleep
+
+        async def no_wait(_):
+            await real_sleep(0)
+        asyncio.sleep = no_wait
+        try:
+            await coord._shot_pass(coord._shot_candidates(items))
+        finally:
+            asyncio.sleep = real_sleep
+    asyncio.run(run())
+
+    assert [item.shot_scanned for item in items] == [True, True, True, False]
+    result = similar.group_similar(items, 30)
+    # The shaky and sharp snaps are one moment; the next shot is a different picture.
+    assert [item.source_id for item in result.kept] == ["sharp", "next_shot", "unreachable"]
+    assert saved and len(saved[-1]["shots"]) == 3
+
+    # After a refresh the album is listed afresh; stored fingerprints come back.
+    fresh = [_remote("shaky", T0), _remote("sharp", T0 + 2_000)]
+    asyncio.run(coord._apply_known_shots(fresh))
+    assert all(item.shot_scanned and item.fingerprint for item in fresh)
+
+
+def test_google_previews_are_requested_small():
+    import asyncio
+
+    asked = []
+    cam = camera.AlbumSlideshowCamera.__new__(camera.AlbumSlideshowCamera)
+    cam.coordinator = types.SimpleNamespace(provider="google_shared")
+
+    async def fake_fetch(url):
+        asked.append(url)
+        return b"jpeg"
+
+    cam._fetch_remote = fake_fetch
+    item = _remote("abc", T0)
+    item.url = "https://lh3.googleusercontent.com/pw/AP1GczExample=w4000-h3000"
+    assert asyncio.run(cam._shot_preview_bytes(item)) == b"jpeg"
+    assert asked == ["https://lh3.googleusercontent.com/pw/AP1GczExample=w512-h512"]
+    # Other web sources use the photo's own link.
+    cam.coordinator = types.SimpleNamespace(provider="immich")
+    item.url = "https://immich.local/api/assets/1/thumbnail?size=preview"
+    asyncio.run(cam._shot_preview_bytes(item))
+    assert asked[-1] == item.url
