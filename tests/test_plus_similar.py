@@ -47,7 +47,12 @@ def test_fingerprints_match_a_resnap_but_not_another_scene():
     fp_other, _ = similar.fingerprint_image(_scene(2))
     assert similar.distance(fp_base, fp_resnap) <= similar.MAX_DISTANCE
     assert similar.distance(fp_base, fp_other) > similar.MAX_DISTANCE
-    assert len(fp_base) == 22 and sharp_base > 0
+    # 22 hex digits (hash + colour), then the 16x16 greyscale copy.
+    assert similar.has_detail(fp_base) and len(fp_base.split("~")[0]) == 22 and sharp_base > 0
+    strict = similar.LEVEL_THRESHOLDS["strict"][0]
+    loose = similar.LEVEL_THRESHOLDS["loose"][0]
+    assert similar.detail_score(fp_base, fp_resnap) <= strict
+    assert similar.detail_score(fp_base, fp_other) > loose
 
 
 def test_blurred_shot_scores_less_sharp():
@@ -63,7 +68,7 @@ def test_local_scan_records_fingerprint_and_sharpness(tmp_path):
     exif.get_ifd(0x8769)[36867] = "2025:12:31 18:30:02"
     _scene(4).save(path, quality=90, exif=exif)
     info = _read_local_photo(path)
-    assert len(info["fingerprint"]) == 22
+    assert similar.has_detail(info["fingerprint"])
     assert info["sharpness"] > 0
     assert "captured_at" in info
 
@@ -302,7 +307,173 @@ def test_google_previews_are_requested_small():
     assert asyncio.run(cam._shot_preview_bytes(item)) == b"jpeg"
     assert asked == ["https://lh3.googleusercontent.com/pw/AP1GczExample=w512-h512"]
     # Other web sources use the photo's own link.
-    cam.coordinator = types.SimpleNamespace(provider="immich")
-    item.url = "https://immich.local/api/assets/1/thumbnail?size=preview"
+    cam.coordinator = types.SimpleNamespace(provider="nextcloud")
+    item.url = "https://cloud.example/remote.php/dav/files/me/IMG_1.jpg"
     asyncio.run(cam._shot_preview_bytes(item))
     assert asked[-1] == item.url
+    # Immich: its own preview, even when the slides use the original.
+    cam.coordinator = types.SimpleNamespace(provider="immich")
+    item.url = "https://immich.local/api/assets/1a2b/original"
+    asyncio.run(cam._shot_preview_bytes(item))
+    assert asked[-1] == "https://immich.local/api/assets/1a2b/thumbnail?size=preview"
+
+
+# ---------------------------------------------------------------------------
+# 1.2.0: match levels, no chaining, background comparisons
+# ---------------------------------------------------------------------------
+
+
+def _with_person(img: Image.Image, x: int) -> Image.Image:
+    """The same backdrop with a person-sized shape at ``x``."""
+    out = img.copy()
+    draw = ImageDraw.Draw(out)
+    draw.rectangle([x, 150, x + 220, 560], fill=(30, 30, 30))
+    draw.ellipse([x + 50, 60, x + 170, 180], fill=(200, 170, 140))
+    return out
+
+
+def _bits(count: int) -> str:
+    """A pre-1.2.0 fingerprint whose hash has ``count`` bits set, grey colour."""
+    return f"{(1 << count) - 1:016x}808080"
+
+
+def test_someone_who_moved_is_a_different_picture_at_every_level():
+    backdrop = _scene(20)
+    here, _ = similar.fingerprint_image(_with_person(backdrop, 60))
+    again, _ = similar.fingerprint_image(_resnap(_with_person(backdrop, 60)))
+    moved, _ = similar.fingerprint_image(_with_person(backdrop, 480))
+    for level in similar.MATCH_LEVELS:
+        items = [_photo("a", at=T0, fp=here, sharp=5), _photo("b", at=T0 + 3_000, fp=again, sharp=4),
+                 _photo("c", at=T0 + 6_000, fp=moved, sharp=9)]
+        result = similar.group_similar(items, 30, level=level)
+        assert [item.filename for item in result.kept] == ["a.jpg", "c.jpg"], level
+
+
+def test_levels_differ_only_in_how_alike_shots_must_be():
+    a, b = _photo("a", at=T0, fp=_bits(0), sharp=2), _photo("b", at=T0 + 1_000, fp=_bits(7), sharp=1)
+    # Old fingerprints fall back to the hash: 7 bits apart.
+    assert similar.group_similar([a, b], 30, level="strict").folded == 0
+    assert similar.group_similar([a, b], 30, level="balanced").folded == 1
+    assert similar.group_similar([a, b], 30, level="loose").folded == 1
+    strict, balanced, loose = (similar.LEVEL_THRESHOLDS[level] for level in similar.MATCH_LEVELS)
+    assert strict < balanced < loose
+    # An unknown level behaves as the default.
+    assert similar.group_similar([a, b], 30, level="bogus").folded == 1
+
+
+def test_a_run_of_slowly_changing_shots_does_not_chain_into_one_group():
+    # a~b and b~c, but a and c differ: a shot must match the whole group.
+    items = [
+        _photo("a", at=T0, fp=_bits(0), sharp=3),
+        _photo("b", at=T0 + 2_000, fp=_bits(7), sharp=2),
+        _photo("c", at=T0 + 4_000, fp=_bits(14), sharp=1),
+    ]
+    result = similar.group_similar(items, 30, level="balanced")
+    assert result.folded == 1
+    assert [item.filename for item in result.kept] == ["a.jpg", "c.jpg"]
+
+
+def test_a_group_lasts_one_window_from_its_first_shot():
+    fp, sharp = similar.fingerprint_image(_scene(21))
+    items = [_photo(name, at=T0 + offset, fp=fp, sharp=sharp)
+             for name, offset in (("a", 0), ("b", 20_000), ("c", 40_000))]
+    result = similar.group_similar(items, 30)
+    # a and b are one moment; c is 40 s after a, so it starts a new group.
+    assert result.folded == 1 and len(result.kept) == 2
+
+
+def _burst(prefix: str, start: int, seed: int) -> list[MediaItem]:
+    base = _scene(seed)
+    out = []
+    for n, img in enumerate((base, _resnap(base), base.filter(ImageFilter.GaussianBlur(2)))):
+        fp, sharp = similar.fingerprint_image(img)
+        out.append(_photo(f"{prefix}{n}", at=start + n * 2_000, fp=fp, sharp=sharp))
+    return out
+
+
+def test_comparisons_are_worked_out_in_the_background_when_the_budget_runs_out():
+    similar.clear_scores()
+    items = _burst("x", T0, 30) + _burst("y", T0 + 600_000, 31)
+    short = similar.group_similar(items, 30, budget=0)
+    assert short.folded == 0 and short.incomplete
+    version = similar.scores_version()
+    assert similar.warm_scores(items, 30) == 6  # three pairs in each burst
+    assert similar.scores_version() > version
+    assert similar.warm_scores(items, 30) == 0
+    done = similar.group_similar(items, 30, budget=0)
+    assert done.folded == 4 and not done.incomplete
+    # Unlimited (the default) works them out inline.
+    similar.clear_scores()
+    assert similar.group_similar(items, 30).folded == 4
+
+
+def test_scores_without_numpy_match_numpy(monkeypatch):
+    pytest = __import__("pytest")
+    numpy = pytest.importorskip("numpy")
+    assert numpy is not None
+    base = _scene(40)
+    pairs = [
+        (base, _resnap(base)), (base, _scene(41)),
+        (_with_person(base, 60), _with_person(base, 480)),
+    ]
+    fingerprints = [(similar.fingerprint_image(a)[0], similar.fingerprint_image(b)[0]) for a, b in pairs]
+    similar.clear_scores()
+    with_numpy = [similar.detail_score(a, b) for a, b in fingerprints]
+    similar.clear_scores()
+    monkeypatch.setattr(similar, "_np", None)
+    without = [similar.detail_score(a, b) for a, b in fingerprints]
+    assert all(abs(x - y) < 1e-3 for x, y in zip(with_numpy, without))
+    # warm_scores takes the same path.
+    similar.clear_scores()
+    items = [_photo("a", at=T0, fp=fingerprints[0][0]), _photo("b", at=T0 + 1_000, fp=fingerprints[0][1])]
+    assert similar.warm_scores(items, 30) == 1
+    similar.clear_scores()
+
+
+def test_fingerprints_from_before_1_2_are_read_again():
+    from custom_components.album_slideshow_plus.coordinator import AlbumCoordinator
+
+    coord = AlbumCoordinator.__new__(AlbumCoordinator)
+    coord.provider = "local_folder"
+    coord.store = types.SimpleNamespace(group_similar_shots=True, similar_window_seconds=30)
+    fp_new, sharp = similar.fingerprint_image(_scene(50))
+    items = [
+        _photo("old", at=T0, fp=_bits(3), sharp=1),
+        _photo("new", at=T0 + 2_000, fp=fp_new, sharp=sharp),
+        _photo("unreadable", at=T0 + 3_000),
+    ]
+    for item in items:
+        item.exif_scanned = True
+    items[2].shot_scanned = True
+    assert [item.filename for item in coord._shot_candidates(items)] == ["old.jpg"]
+
+
+def test_the_playlist_uses_the_chosen_match_level():
+    items = [_photo("a", at=T0, fp=_bits(0), sharp=2), _photo("b", at=T0 + 1_000, fp=_bits(7), sharp=1)]
+    cam = _cam(items)
+    cam.store.similar_match = "strict"
+    assert len(cam._effective_items()) == 2
+    cam.store.similar_match = "balanced"
+    assert [item.filename for item in cam._effective_items()] == ["a.jpg"]
+    assert cam._similar_input == items
+
+
+def test_sensor_reports_what_each_level_would_skip():
+    from custom_components.album_slideshow_plus import sensor
+    from custom_components.album_slideshow_plus.const import DOMAIN
+
+    items = [
+        _photo("a", at=T0, fp=_bits(0), sharp=3), _photo("b", at=T0 + 1_000, fp=_bits(4), sharp=2),
+        _photo("c", at=T0 + 600_000, fp=_bits(0), sharp=3), _photo("d", at=T0 + 601_000, fp=_bits(10), sharp=1),
+    ]
+    cam = _cam(items)
+    cam.store.similar_match = "balanced"
+    ent = sensor.SimilarShotsSensor.__new__(sensor.SimilarShotsSensor)
+    ent.entry = types.SimpleNamespace(entry_id="e1")
+    ent.hass = types.SimpleNamespace(data={DOMAIN: {"e1": {"camera": cam}}})
+    ent.coordinator = types.SimpleNamespace(store=cam.store, data={"items": items})
+    attrs = ent.extra_state_attributes
+    assert ent.native_value == 1
+    assert attrs["match"] == "balanced"
+    assert attrs["skipped_if"] == {"strict": 1, "balanced": 1, "loose": 2}
+    assert attrs["photos_rechecking"] == 4

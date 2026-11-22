@@ -41,6 +41,7 @@ from .const import (
     DEFAULT_SLEEP_END,
     DEFAULT_GROUP_SIMILAR,
     DEFAULT_SIMILAR_WINDOW_SECONDS,
+    DEFAULT_SIMILAR_MATCH,
 )
 
 
@@ -136,6 +137,7 @@ class SlideshowStore:
     # Repeated snaps of one moment play once, as the sharpest shot.
     group_similar_shots: bool = DEFAULT_GROUP_SIMILAR
     similar_window_seconds: int = DEFAULT_SIMILAR_WINDOW_SECONDS
+    similar_match: str = DEFAULT_SIMILAR_MATCH
 
     # In-memory last rendered frame. Not user-configurable; used to re-serve
     # the previous slide instantly across a camera reload.

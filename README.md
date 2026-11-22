@@ -102,12 +102,29 @@ Entities: `select.…_spotlight_new_photos`, `number.…_spotlight_every`,
 When you take a few snaps of the same thing, only the sharpest plays.
 Shots are grouped when both of these hold:
 
-* **Taken within the Similar shot window** of each other (default 30 s,
-  2–600 s). This uses the photo's own capture time from EXIF.
-* **They look the same.** Each candidate gets a visual fingerprint (a
-  difference hash of a tiny greyscale copy, plus its average colour). A
-  re-framed or re-exposed snap still matches; a different subject shot
-  seconds later doesn't.
+* **Taken within the Similar shot window** (default 30 s, 2–600 s). A
+  group never lasts longer than the window from its first shot. This uses
+  the photo's own capture time.
+* **They look the same**, at the **Similar shot match** level, compared
+  with *every* shot already in the group. Matching just one would let a
+  run of slightly different photos chain into one long group.
+
+| Similar shot match | Groups |
+|---|---|
+| **Strict** | Near-identical retakes only: same pose, a touch of camera shake |
+| **Balanced** (default) | Retakes of one pose, re-framed or re-exposed a little |
+| **Loose** | Also shots where people shifted slightly between snaps |
+
+Someone who changed pose, turned or moved, or a different person in front
+of the same backdrop, counts as a different picture: in testing, fewer than
+2 in 100 such pairs matched even at Loose, and none at Strict.
+
+How "look the same" works: each candidate is shrunk to a 16×16 greyscale
+copy, normalised for brightness and contrast, and compared cell by cell
+with the other shot, allowing for the camera moving a little. A person who
+moved changes many cells; a retake changes few. The average colour must
+be close too. The levels were calibrated on real camera footage: snaps of
+one pose a moment apart against the same scene seconds later.
 
 From each group the **sharpest** shot is kept. Sharpness is the variance
 of edge strength, so a shaken or out-of-focus take loses. It judges focus
@@ -116,29 +133,35 @@ one photo everywhere: the normal rotation, the new-photo spotlight, story
 mode and pairing. Nothing is deleted; turn **Group similar shots** off and
 every snap plays again.
 
+**Choosing a level:** the **Similar shots skipped** sensor has a
+`skipped_if` attribute with the count for each level, so you can compare
+them without switching back and forth. Its `examples` list the kept and
+skipped files of some groups, to check in your photo app.
+
 * Only photos with another photo inside the window are fingerprinted, so
   a NAS library isn't downloaded end to end. Each one is checked once, in
   the background, and the result is saved, so a restart doesn't repeat it.
 * Local folders: the file itself is read. Other sources: a small preview
-  is downloaded once for each candidate (512 px for Google shared albums;
-  the source's own photo link elsewhere). Only the fingerprint is kept.
+  is downloaded once for each candidate (512 px for Google shared albums,
+  Immich's own preview size for Immich, the photo's link elsewhere). Only
+  the fingerprint is kept.
 * Photos without their own capture time (EXIF stripped, as in many
   WhatsApp copies) are never grouped. A file's modified time would group
   whatever was copied together.
 * A photo is never grouped until it has a fingerprint. Right after
-  installing or updating, the count climbs as the background check works
-  through the library.
-
-> **1.1.1 fix:** 1.1.0 grouped photos from sources other than local
-> folders by time and pixel size alone. With phone photos that are all the
-> same size, that hid most of a library. 1.1.1 groups only shots that also
-> look the same, and fingerprints those sources from a small preview.
+  installing, the count climbs as the background check works through the
+  library.
+* **Updating from 1.1.x:** photos checked by 1.1 are read once more in the
+  background (`photos_rechecking` counts down). Until then they are
+  compared the old way, at the chosen level.
 
 Entities: `switch.…_group_similar_shots` (on by default),
+`select.…_similar_shot_match` (strict / balanced / loose),
 `number.…_similar_shot_window`, `sensor.…_similar_shots_skipped` (with
-`groups`, `photos_compared` and `examples` of kept/skipped files). Camera
-attributes: `similar_shots` (how many snaps the photo on screen stands for),
-`similar_groups`, `similar_shots_folded`.
+`groups`, `match`, `skipped_if`, `photos_compared`, `photos_rechecking` and
+`examples`). Camera attributes: `similar_shots` (how many snaps the photo
+on screen stands for), `similar_groups`, `similar_shots_folded`,
+`similar_match`.
 
 ## Memories, story mode and sleep
 
@@ -197,7 +220,7 @@ and sleep**. The spotlight, memories, story and sleep settings appear under
 `memories_every`, `story_length`, `story_window_hours`, `sleep_schedule`,
 `sleep_start`, `sleep_end`, `sleeping`, `slide_hold_seconds`,
 `slide_ends_at`, `group_similar_shots`, `similar_window_seconds`,
-`similar_groups`, `similar_shots_folded`, `similar_shots`.
+`similar_match`, `similar_groups`, `similar_shots_folded`, `similar_shots`.
 
 ## Actions and events
 

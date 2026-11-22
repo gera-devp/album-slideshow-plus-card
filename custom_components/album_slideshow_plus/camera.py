@@ -38,6 +38,7 @@ from .const import (
     ORDER_ALBUM,
     ORDER_RANDOM,
     PROVIDER_GOOGLE_SHARED,
+    PROVIDER_IMMICH,
     DEFAULT_SPOTLIGHT_MODE,
     DEFAULT_SPOTLIGHT_EVERY,
     DEFAULT_NEW_WINDOW,
@@ -50,6 +51,7 @@ from .const import (
     DEFAULT_SLEEP_END,
     DEFAULT_GROUP_SIMILAR,
     DEFAULT_SIMILAR_WINDOW_SECONDS,
+    DEFAULT_SIMILAR_MATCH,
 )
 from . import image_processing as ip
 from . import similar
@@ -141,7 +143,12 @@ _RENDER_SETTINGS = (
     "story_window_hours",
     "group_similar_shots",
     "similar_window_seconds",
+    "similar_match",
 )
+
+# Similar-shot comparisons the playlist may work out itself per rebuild;
+# the rest come from the coordinator's background worker.
+_SIMILAR_INLINE_BUDGET = 300
 
 # Spotlight kinds, as published in the ``spotlight`` attribute.
 SPOTLIGHT_NEW = "new"
@@ -444,6 +451,8 @@ class AlbumSlideshowCamera(Camera):
     _unsub_sleep = None
     # Last similar-shot grouping of the playlist.
     _grouping: similar.Grouping | None = None
+    # The playlist before grouping, for the sensor's per-level counts.
+    _similar_input: list = []
 
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry, coordinator: AlbumCoordinator, store: SlideshowStore) -> None:
         super().__init__()
@@ -808,6 +817,7 @@ class AlbumSlideshowCamera(Camera):
             "slide_ends_at": ends_at,
             "group_similar_shots": bool(self._setting("group_similar_shots", DEFAULT_GROUP_SIMILAR)),
             "similar_window_seconds": int(self._setting("similar_window_seconds", DEFAULT_SIMILAR_WINDOW_SECONDS)),
+            "similar_match": str(self._setting("similar_match", DEFAULT_SIMILAR_MATCH)),
             "similar_groups": len(self._grouping.groups) if self._grouping else 0,
             "similar_shots_folded": self._grouping.folded if self._grouping else 0,
             # The photo on screen stands for this many snaps (1 = no group).
@@ -882,8 +892,11 @@ class AlbumSlideshowCamera(Camera):
             self.store.hidden_revision,
             bool(getattr(self.store, "group_similar_shots", False)),
             getattr(self.store, "similar_window_seconds", DEFAULT_SIMILAR_WINDOW_SECONDS),
-            # Fingerprints arrive in the background without a new list.
-            sum(1 for item in raw if getattr(item, "shot_scanned", False)),
+            getattr(self.store, "similar_match", DEFAULT_SIMILAR_MATCH),
+            # Fingerprints and their comparisons arrive in the background
+            # without a new list.
+            getattr(self.coordinator, "shots_revision", 0),
+            similar.scores_version(),
             # Date filters move to the next day at local midnight.
             datetime.now(tz).toordinal()
             if self.store.date_filter not in (None, "", DATE_FILTER_OFF)
@@ -908,11 +921,16 @@ class AlbumSlideshowCamera(Camera):
             if key not in seen:
                 seen.add(key)
                 unique.append(item)
+        self._similar_input = unique
         if getattr(self.store, "group_similar_shots", False):
             # Repeated snaps of one moment count as one photo: the sharpest.
             self._grouping = similar.group_similar(
                 unique,
                 getattr(self.store, "similar_window_seconds", DEFAULT_SIMILAR_WINDOW_SECONDS),
+                level=getattr(self.store, "similar_match", DEFAULT_SIMILAR_MATCH),
+                # Comparisons not worked out yet are done in the background
+                # (the coordinator's shot worker); never stall the loop here.
+                budget=_SIMILAR_INLINE_BUDGET,
             )
             unique = self._grouping.kept
         else:
@@ -2857,10 +2875,16 @@ class AlbumSlideshowCamera(Camera):
         url = item.url
         try:
             if url.startswith("http"):
-                if getattr(self.coordinator, "provider", None) == PROVIDER_GOOGLE_SHARED:
+                provider = getattr(self.coordinator, "provider", None)
+                if provider == PROVIDER_GOOGLE_SHARED:
                     from .google_scraper import _SIZE_SUFFIX_RE
 
                     url = _SIZE_SUFFIX_RE.sub("", url) + "=w512-h512"
+                elif provider == PROVIDER_IMMICH and "/api/assets/" in url:
+                    # Immich's own preview, whatever size the slides use
+                    # (an original can be many megabytes).
+                    base, _, rest = url.partition("/api/assets/")
+                    url = f"{base}/api/assets/{rest.split('/', 1)[0]}/thumbnail?size=preview"
                 return await self._fetch_remote(url)
             if not url.startswith("file://"):
                 return await self._provider_bytes(url)

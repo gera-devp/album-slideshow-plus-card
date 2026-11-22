@@ -12,6 +12,7 @@ from .const import (
     PROVIDER_GOOGLE_SHARED,
 )
 from .coordinator import AlbumCoordinator
+from . import similar
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback) -> None:
@@ -262,12 +263,40 @@ class SimilarShotsSensor(_BaseAlbumSensor):
         await super().async_added_to_hass()
         self.coordinator.store.add_listener(self.async_write_ha_state)
 
+    _level_counts: tuple | None = None
+
+    def _camera(self):
+        return self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id, {}).get("camera")
+
     def _grouping(self):
-        camera = self.hass.data.get(DOMAIN, {}).get(self.entry.entry_id, {}).get("camera")
+        camera = self._camera()
         if camera is None:
             return None
         camera._effective_items()
         return camera._grouping
+
+    def _skipped_by_level(self) -> dict[str, int]:
+        """What each match level would skip, from comparisons already made."""
+        camera = self._camera()
+        if camera is None:
+            return {}
+        camera._effective_items()
+        items = getattr(camera, "_similar_input", None) or []
+        store = self.coordinator.store
+        key = (
+            id(items), len(items), store.similar_window_seconds,
+            getattr(self.coordinator, "shots_revision", 0), similar.scores_version(),
+        )
+        if self._level_counts is not None and self._level_counts[0] == key:
+            return self._level_counts[1]
+        counts = {
+            level: similar.group_similar(
+                items, store.similar_window_seconds, level=level, budget=0,
+            ).folded
+            for level in similar.MATCH_LEVELS
+        }
+        self._level_counts = (key, counts)
+        return counts
 
     @property
     def native_value(self):
@@ -282,9 +311,20 @@ class SimilarShotsSensor(_BaseAlbumSensor):
         groups = grouping.groups if grouping else []
         items = (self.coordinator.data or {}).get("items") or []
         checked = sum(1 for item in items if getattr(item, "shot_scanned", False))
+        rechecking = sum(
+            1 for item in items
+            if getattr(item, "fingerprint", None) and not similar.has_detail(item.fingerprint)
+        )
         return {
             "groups": len(groups),
+            "match": self.coordinator.store.similar_match,
             "window_seconds": self.coordinator.store.similar_window_seconds,
+            # How many photos each match level would skip, to compare them
+            # without switching back and forth.
+            "skipped_if": self._skipped_by_level() if grouping is not None else {},
+            # Photos checked by an older version, being read again so the
+            # match levels can compare them properly.
+            "photos_rechecking": rechecking,
             # Local folders: photos taken within the window of another one
             # that have been compared so far (only those can be repeats).
             "photos_compared": checked,

@@ -25,6 +25,7 @@ from .const import (
     SPOTLIGHT_MODE_OPTIONS,
     NEW_WINDOW_OPTIONS,
     NEW_DETECT_OPTIONS,
+    SIMILAR_MATCH_OPTIONS,
 )
 from .store import SlideshowStore
 
@@ -65,6 +66,10 @@ async def async_setup_entry(
             _StoreSelect(
                 entry, store, "memories_mode", "Memories (on this day)",
                 "mdi:calendar-heart", SPOTLIGHT_MODE_OPTIONS,
+            ),
+            _StoreSelect(
+                entry, store, "similar_match", "Similar shot match",
+                "mdi:tune-variant", SIMILAR_MATCH_OPTIONS,
             ),
         ]
     )

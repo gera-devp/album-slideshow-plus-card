@@ -464,3 +464,6 @@ DEFAULT_GROUP_SIMILAR = True
 DEFAULT_SIMILAR_WINDOW_SECONDS = 30
 MIN_SIMILAR_WINDOW_SECONDS = 2
 MAX_SIMILAR_WINDOW_SECONDS = 600
+# How alike two snaps must look to count as one moment.
+SIMILAR_MATCH_OPTIONS = ["strict", "balanced", "loose"]
+DEFAULT_SIMILAR_MATCH = "balanced"

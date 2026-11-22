@@ -1377,6 +1377,8 @@ class AlbumCoordinator(DataUpdateCoordinator):
         self._shots_loaded = False
         self._shot_task: asyncio.Task | None = None
         self.shot_fetcher = None
+        # Bumped whenever fingerprints change, so the playlist regroups.
+        self.shots_revision = 0
 
         super().__init__(
             hass,
@@ -3401,7 +3403,9 @@ class AlbumCoordinator(DataUpdateCoordinator):
         wanted: list[MediaItem] = []
         for position, (ts, index) in enumerate(dated):
             item = items[index]
-            if item.shot_scanned:
+            # Fingerprints from before 1.2.0 lack the greyscale copy that
+            # the match levels compare, so those photos are read again.
+            if item.shot_scanned and (item.fingerprint is None or similar.has_detail(item.fingerprint)):
                 continue
             before = position > 0 and ts - dated[position - 1][0] <= window_ms
             after = position + 1 < len(dated) and dated[position + 1][0] - ts <= window_ms
@@ -3441,6 +3445,7 @@ class AlbumCoordinator(DataUpdateCoordinator):
             if known is not None:
                 item.fingerprint, item.sharpness = known
                 item.shot_scanned = True
+        self.shots_revision = getattr(self, "shots_revision", 0) + 1
         if len(self._shots) > max(2 * len(items), 200):
             keep = {sp.photo_key(item) for item in items}
             self._shots = {key: value for key, value in self._shots.items() if key in keep}
@@ -3461,12 +3466,28 @@ class AlbumCoordinator(DataUpdateCoordinator):
             name=f"{DOMAIN}_similar_shots_{self.entry.entry_id}",
         )
 
+    async def _warm_similar(self, items: list[MediaItem]) -> None:
+        """Compare the fingerprinted shots in the background, off the event loop."""
+        store = getattr(self, "store", None)
+        if not getattr(store, "group_similar_shots", False):
+            return
+        window = getattr(store, "similar_window_seconds", 30)
+        try:
+            added = await self.hass.async_add_executor_job(similar.warm_scores, list(items), window)
+        except Exception as err:  # noqa: BLE001 - grouping just waits for the next pass
+            _LOGGER.debug("Album Slideshow Plus: could not compare similar shots: %s", err)
+            return
+        if added:
+            self.async_update_listeners()
+
     async def _shot_worker(self, items: list[MediaItem]) -> None:
         await self._ensure_shots_loaded()
+        # Shots fingerprinted earlier only need comparing.
+        await self._warm_similar(items)
         while True:
             work = self._shot_candidates(items)
             if work:
-                await self._shot_pass(work)
+                await self._shot_pass(work, items)
             # Local capture times arrive from the date scan; check again
             # once it has finished.
             enrich = getattr(self, "_enrichment_task", None)
@@ -3475,7 +3496,7 @@ class AlbumCoordinator(DataUpdateCoordinator):
                 continue
             return
 
-    async def _shot_pass(self, work: list[MediaItem]) -> None:
+    async def _shot_pass(self, work: list[MediaItem], items: list[MediaItem] | None = None) -> None:
         """Fingerprint the photos that could be repeated snaps of one moment."""
         _LOGGER.debug("Album Slideshow Plus: checking %d photos for repeated snaps", len(work))
         fetcher = getattr(self, "shot_fetcher", None)
@@ -3505,12 +3526,15 @@ class AlbumCoordinator(DataUpdateCoordinator):
             item.fingerprint, item.sharpness = shot if shot else (None, None)
             item.shot_scanned = True
             self._shots[sp.photo_key(item)] = [item.fingerprint, item.sharpness]
+            self.shots_revision = getattr(self, "shots_revision", 0) + 1
             changed += 1
             if changed % 25 == 0:
                 self._save_shots()
+                await self._warm_similar(items or work)
                 self.async_update_listeners()
         if changed:
             self._save_shots()
+            await self._warm_similar(items or work)
             self.async_update_listeners()
 
     async def _flush_enrichment(self, data: dict[str, Any]) -> None:
