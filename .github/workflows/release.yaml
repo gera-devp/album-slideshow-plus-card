@@ -3,6 +3,9 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  # A release published from the GitHub web page creates its tag there.
+  release:
+    types: [published]
 
 permissions:
   contents: write
@@ -16,7 +19,8 @@ jobs:
       - name: Verify manifest.json version matches the tag
         run: |
           VERSION=$(python3 -c "import json;print(json.load(open('custom_components/album_slideshow_plus/manifest.json'))['version'])")
-          TAG="${GITHUB_REF_NAME#v}"
+          TAG="${{ github.event.release.tag_name || github.ref_name }}"
+          TAG="${TAG#v}"
           if [ "$VERSION" != "$TAG" ]; then
             echo "::error::manifest.json version ($VERSION) does not match tag ($TAG)"
             exit 1
@@ -30,5 +34,6 @@ jobs:
       - name: Attach the zip to the release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.release.tag_name || github.ref_name }}
           files: album_slideshow_plus.zip
           fail_on_unmatched_files: true
